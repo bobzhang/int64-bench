@@ -28,12 +28,21 @@ Node v25.8.2, Apple Silicon (arm64):
 | Int64.div (binary long division) | 494.6 | 33.8x |
 | WASM batch (pre-loaded) | 0.81 | 0.06x |
 
+### Analysis: WASM Boundary Cost vs BigInt Allocation
+
+The JS-to-WASM boundary round-trip costs ~10-15ns (BigInt in -> i64 -> BigInt out). Whether WASM wins depends on whether that boundary cost is cheaper than V8's native BigInt operation:
+
+- **Multiplication**: WASM wins even with boundary cost (14.7ns vs 54.3ns). V8's BigInt multiplication allocates a new heap object for the result, which is more expensive than the WASM round-trip. **WASM is 3.7x faster**.
+- **Division**: Essentially tied (14.6ns BigInt vs 15.3ns WASM). V8 has heavily optimized small-BigInt division -- likely using the hardware `div` instruction directly for values that fit in 64 bits, the same instruction WASM emits. No reason to go through WASM for division.
+- **Two-int32 class**: Competitive for multiplication (16.2ns) but catastrophic for division (494.6ns / 34x slower). Binary long division in JS allocates new Int64 objects on every shift/sub/compare inside a ~38-iteration loop -- GC pressure dominates.
+
 ### Key Takeaways
 
-- **Multiplication**: Two-int32 with 16-bit chunk decomposition is competitive (~16ns), only slightly slower than a WASM boundary call (~15ns). BigInt mul is 3.7x slower.
-- **Division**: Two-int32 binary long division is **34x slower** than BigInt or WASM. V8's BigInt division matches native WASM `i64.div_s`. Don't implement your own long division in JS.
-- **WASM batch**: When data already lives in linear memory, WASM crushes everything at sub-1ns/op -- but the JS-to-WASM boundary cost (~10-15ns) dominates for single calls.
-- **Bottom line**: Just use BigInt for division. For multiplication, two-int32 is viable if you want to avoid BigInt allocation. WASM only wins if you can batch.
+- **For multiplication-heavy workloads**: Use WASM single calls -- 3.7x faster than pure BigInt, even accounting for boundary cost
+- **For division-heavy workloads**: Just use BigInt directly -- V8's optimizer matches native WASM performance
+- **For mixed workloads**: WASM single calls are a good default (fastest mul, tied on div)
+- **For batch processing**: If data can live in WASM linear memory, sub-1ns/op is achievable -- 15-20x faster than any single-call approach
+- **Avoid two-int32 for division**: Don't implement your own long division in JS
 
 ## Correctness
 
