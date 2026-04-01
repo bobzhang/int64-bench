@@ -111,6 +111,13 @@ class Int64 {
     return new Int64(hi | 0, lo);
   }
 
+  add(other) {
+    const lo = (this.lo + other.lo) >>> 0;
+    const carry = (lo < this.lo) ? 1 : 0;
+    const hi = (this.hi + other.hi + carry) | 0;
+    return new Int64(hi, lo);
+  }
+
   sub(other) {
     const lo = (this.lo - other.lo) >>> 0;
     const borrow = (this.lo < other.lo) ? 1 : 0;
@@ -197,7 +204,8 @@ const wasmModule = new WebAssembly.Module(wasmBytes);
 const wasmInstance = new WebAssembly.Instance(wasmModule, {});
 const {
   mul_i64, div_s_i64, div_u_i64, rem_s_i64,
-  mul_i64_batch, div_s_i64_batch, memory
+  add_i64, sub_i64,
+  mul_i64_batch, div_s_i64_batch, add_i64_batch, memory
 } = wasmInstance.exports;
 const wasmDV = new DataView(memory.buffer);
 
@@ -228,6 +236,24 @@ function verify() {
   for (const [a, b] of cases) {
     const ai = Int64.fromBigInt(a);
     const bi = Int64.fromBigInt(b);
+
+    // -- Addition --
+    const refAdd = BigInt.asIntN(64, a + b);
+    const gotAdd64 = ai.add(bi).toBigInt();
+    const gotAddBI = BigInt.asIntN(64, a + b);
+    const gotAddW = add_i64(a, b);
+    const addOk = gotAdd64 === refAdd && gotAddBI === refAdd && gotAddW === refAdd;
+    console.log(`  add(${String(a).padStart(22)}, ${String(b).padStart(22)}) = ${String(refAdd).padStart(22)}  int64=${gotAdd64 === refAdd ? 'OK' : 'FAIL'} bigint=${gotAddBI === refAdd ? 'OK' : 'FAIL'} wasm=${gotAddW === refAdd ? 'OK' : 'FAIL'}`);
+    if (addOk) pass++; else fail++;
+
+    // -- Subtraction --
+    const refSub = BigInt.asIntN(64, a - b);
+    const gotSub64 = ai.sub(bi).toBigInt();
+    const gotSubBI = BigInt.asIntN(64, a - b);
+    const gotSubW = sub_i64(a, b);
+    const subOk = gotSub64 === refSub && gotSubBI === refSub && gotSubW === refSub;
+    console.log(`  sub(${String(a).padStart(22)}, ${String(b).padStart(22)}) = ${String(refSub).padStart(22)}  int64=${gotSub64 === refSub ? 'OK' : 'FAIL'} bigint=${gotSubBI === refSub ? 'OK' : 'FAIL'} wasm=${gotSubW === refSub ? 'OK' : 'FAIL'}`);
+    if (subOk) pass++; else fail++;
 
     // -- Multiplication --
     const refMul = BigInt.asIntN(64, a * b);
@@ -321,8 +347,50 @@ function runBenchmarks() {
 
   let sink = 0;
 
+  // ── ADDITION ──
+  console.log(`=== Addition (${PAIR_COUNT} pairs × ${LOOP_ITERS} loops = ${(PAIR_COUNT * LOOP_ITERS).toLocaleString()} ops) ===\n`);
+
+  results.push(bench('1. Int64.add (two int32)', () => {
+    for (let i = 0; i < PAIR_COUNT; i++) {
+      sink += pairs64[i][0].add(pairs64[i][1]).lo & 0xFF;
+    }
+  }, LOOP_ITERS));
+
+  results.push(bench('2. BigInt add + asIntN(64)', () => {
+    for (let i = 0; i < PAIR_COUNT; i++) {
+      sink += Number(BigInt.asIntN(64, pairsBig[i][0] + pairsBig[i][1]) & 0xFFn);
+    }
+  }, LOOP_ITERS));
+
+  results.push(bench('3. WASM i64.add (single calls)', () => {
+    for (let i = 0; i < PAIR_COUNT; i++) {
+      sink += Number(add_i64(pairsBig[i][0], pairsBig[i][1]) & 0xFFn);
+    }
+  }, LOOP_ITERS));
+
+  // ── SUBTRACTION ──
+  console.log(`\n=== Subtraction (${PAIR_COUNT} pairs × ${LOOP_ITERS} loops) ===\n`);
+
+  results.push(bench('1. Int64.sub (two int32)', () => {
+    for (let i = 0; i < PAIR_COUNT; i++) {
+      sink += pairs64[i][0].sub(pairs64[i][1]).lo & 0xFF;
+    }
+  }, LOOP_ITERS));
+
+  results.push(bench('2. BigInt sub + asIntN(64)', () => {
+    for (let i = 0; i < PAIR_COUNT; i++) {
+      sink += Number(BigInt.asIntN(64, pairsBig[i][0] - pairsBig[i][1]) & 0xFFn);
+    }
+  }, LOOP_ITERS));
+
+  results.push(bench('3. WASM i64.sub (single calls)', () => {
+    for (let i = 0; i < PAIR_COUNT; i++) {
+      sink += Number(sub_i64(pairsBig[i][0], pairsBig[i][1]) & 0xFFn);
+    }
+  }, LOOP_ITERS));
+
   // ── MULTIPLICATION ──
-  console.log(`=== Multiplication (${PAIR_COUNT} pairs × ${LOOP_ITERS} loops = ${(PAIR_COUNT * LOOP_ITERS).toLocaleString()} ops) ===\n`);
+  console.log(`\n=== Multiplication (${PAIR_COUNT} pairs × ${LOOP_ITERS} loops = ${(PAIR_COUNT * LOOP_ITERS).toLocaleString()} ops) ===\n`);
 
   results.push(bench('1. Int64.mul (two int32, 16-bit chunks)', () => {
     for (let i = 0; i < PAIR_COUNT; i++) {
@@ -363,6 +431,18 @@ function runBenchmarks() {
     }
   }, LOOP_ITERS));
 
+  // ── BATCH ADDITION (WASM amortized) ──
+  console.log(`\n=== Batch Addition (${PAIR_COUNT} pairs, WASM pre-loaded) ===\n`);
+
+  for (let i = 0; i < PAIR_COUNT; i++) {
+    wasmDV.setBigInt64(i * 16, pairsBig[i][0], true);
+    wasmDV.setBigInt64(i * 16 + 8, pairsBig[i][1], true);
+  }
+
+  results.push(bench('3b. WASM i64.add batch (pre-loaded)', () => {
+    add_i64_batch(PAIR_COUNT);
+  }, LOOP_ITERS));
+
   // ── BATCH MULTIPLICATION (WASM amortized) ──
   console.log(`\n=== Batch Multiplication (${PAIR_COUNT} pairs, WASM pre-loaded) ===\n`);
 
@@ -396,10 +476,13 @@ function runBenchmarks() {
   console.log('═'.repeat(80) + '\n');
 
   const groups = [
-    { label: 'Multiplication (per op)', items: results.slice(0, 3), perOp: PAIR_COUNT },
-    { label: 'Division (per op)', items: results.slice(3, 6), perOp: PAIR_COUNT },
-    { label: 'Batch Mul (per op, WASM only)', items: results.slice(6, 7), perOp: PAIR_COUNT },
-    { label: 'Batch Div (per op, WASM only)', items: results.slice(7, 8), perOp: PAIR_COUNT },
+    { label: 'Addition (per op)', items: results.slice(0, 3), perOp: PAIR_COUNT },
+    { label: 'Subtraction (per op)', items: results.slice(3, 6), perOp: PAIR_COUNT },
+    { label: 'Multiplication (per op)', items: results.slice(6, 9), perOp: PAIR_COUNT },
+    { label: 'Division (per op)', items: results.slice(9, 12), perOp: PAIR_COUNT },
+    { label: 'Batch Add (per op, WASM only)', items: results.slice(12, 13), perOp: PAIR_COUNT },
+    { label: 'Batch Mul (per op, WASM only)', items: results.slice(13, 14), perOp: PAIR_COUNT },
+    { label: 'Batch Div (per op, WASM only)', items: results.slice(14, 15), perOp: PAIR_COUNT },
   ];
 
   for (const { label, items, perOp } of groups) {
